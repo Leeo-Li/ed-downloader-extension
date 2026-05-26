@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>Ed Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="title">📚 Ed Downloader</div>
+    <div class="subtitle">备份当前课的 lessons + 公告</div>
+  </header>
+
+  <main>
+    <div id="status" class="status hint">在 Ed 课程页里点 "扫描" 开始</div>
+
+    <div class="actions">
+      <button id="scan" class="btn primary">扫描当前课程</button>
+      <button id="download" class="btn" disabled>下载全部</button>
+    </div>
+
+    <section id="preview" class="preview" hidden>
+      <div class="preview-header">
+        <strong id="course-name"></strong>
+        <span id="course-id" class="muted"></span>
+      </div>
+      <div class="counts">
+        <span class="chip">📁 Lessons: <b id="cnt-lessons">0</b></span>
+        <span class="chip">📄 文件: <b id="cnt-files">0</b></span>
+        <span class="chip">📢 公告: <b id="cnt-announce">0</b></span>
+      </div>
+      <details>
+        <summary>查看清单</summary>
+        <ul id="item-list"></ul>
+      </details>
+    </section>
+
+    <section class="settings">
+      <label>
+        <input type="checkbox" id="opt-lessons" checked> 下载 Lessons / Slides / 附件
+      </label>
+      <label>
+        <input type="checkbox" id="opt-announce" checked> 保存公告 / 置顶帖为 Markdown
+      </label>
+    </section>
+  </main>
+
+  <footer>
+    <a href="https://github.com" target="_blank" id="help">使用说明</a>
+    <span class="muted">v1.0 · 仅限个人学习用途</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
