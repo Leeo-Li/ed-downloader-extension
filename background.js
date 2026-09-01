@@ -1,4 +1,5 @@
-// background.js v1.2 - call Ed API, download files & inline images with proper extensions
+// background.js v1.3 - complete slide backup: questions/activities, raw JSON,
+// external-resource preservation, completeness report, files & inline images.
 //
 // Auth: token from page localStorage, sent as x-token header.
 // CDN files: URLs like https://static.au.edusercontent.com/files/<hash> have no
@@ -272,11 +273,230 @@ function isOfficial(thread, usersDict) {
 function extractSlides(lesson) {
   const slides = lesson.slides || lesson.modules || [];
   return slides.map((s, i) => ({
-    id: s.id || i,
+    id: s.id ?? i,
     title: s.title || ("slide_" + (i + 1)),
-    type: s.type || "unknown",
-    content: s.content || s.document || "",
+    type: s.type || s.kind || s.slide_type || "unknown",
+    // Keep the old field for normal rich-text slides, but do NOT rely on it.
+    content: pickPrimaryContent(s),
+    // Preserve the complete API object so unsupported/new Ed block types are never
+    // silently dropped. Secrets are redacted when written to JSON.
+    raw: s,
+    question: extractQuestionView(s),
+    resources: extractExternalResources(s),
   }));
+}
+
+function firstDefined(...values) {
+  for (const v of values) {
+    if (v !== undefined && v !== null && v !== "") return v;
+  }
+  return null;
+}
+
+// Convert only human-readable fields from an arbitrary API value to Markdown.
+// This intentionally ignores grading/correctness metadata.
+function visibleTextFromValue(value, depth = 0) {
+  if (value == null || depth > 5) return "";
+  if (typeof value === "string") return htmlToMarkdown(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value.map((v) => visibleTextFromValue(v, depth + 1)).filter(Boolean).join("\n");
+  }
+  if (typeof value !== "object") return "";
+
+  const preferred = [
+    "content", "document", "text", "label", "title", "prompt", "stem",
+    "body", "description", "instructions", "question", "caption", "name",
+  ];
+  const parts = [];
+  const seen = new Set();
+  for (const key of preferred) {
+    if (!(key in value)) continue;
+    const text = visibleTextFromValue(value[key], depth + 1).trim();
+    if (text && !seen.has(text)) {
+      seen.add(text);
+      parts.push(text);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+function pickPrimaryContent(s) {
+  const v = firstDefined(
+    s.content, s.document, s.body, s.text, s.prompt, s.stem,
+    s.instructions, s.description,
+    s.question && (s.question.content || s.question.document || s.question.prompt || s.question.text)
+  );
+  return visibleTextFromValue(v);
+}
+
+function findFirstArray(obj, keys, depth = 0) {
+  if (!obj || typeof obj !== "object" || depth > 4) return null;
+  for (const key of keys) {
+    if (Array.isArray(obj[key]) && obj[key].length) return obj[key];
+  }
+  for (const value of Object.values(obj)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const got = findFirstArray(value, keys, depth + 1);
+      if (got) return got;
+    }
+  }
+  return null;
+}
+
+function extractQuestionView(s) {
+  if (!s || typeof s !== "object") return null;
+  const type = String(s.type || s.kind || s.slide_type || "").toLowerCase();
+  const questionish = /question|quiz|poll|choice|response|exercise|activity|assessment/.test(type) ||
+    s.question != null || s.prompt != null || s.stem != null ||
+    Array.isArray(s.options) || Array.isArray(s.choices);
+  if (!questionish) return null;
+
+  const qObj = (s.question && typeof s.question === "object") ? s.question : null;
+  const promptValue = firstDefined(
+    s.prompt, s.stem,
+    qObj && firstDefined(qObj.prompt, qObj.stem, qObj.content, qObj.document, qObj.text),
+    s.content, s.document, s.body, s.instructions, s.description,
+    typeof s.question === "string" ? s.question : null
+  );
+  const prompt = visibleTextFromValue(promptValue).trim();
+
+  // Ed has used different names for selectable/response items over time.
+  // We only render visible text and deliberately ignore keys such as correct/solution.
+  const rawOptions = findFirstArray(s, ["options", "choices", "alternatives", "items", "responses"]);
+  const options = [];
+  if (rawOptions) {
+    for (const o of rawOptions) {
+      const text = visibleTextFromValue(o).trim();
+      if (text && !options.includes(text)) options.push(text);
+    }
+  }
+
+  const responseType = String(firstDefined(
+    s.response_type, s.responseType, s.question_type, s.questionType,
+    qObj && firstDefined(qObj.response_type, qObj.responseType, qObj.type),
+    s.type
+  ) || "");
+
+  return { prompt, options, responseType };
+}
+
+function collectUrls(payload) {
+  const out = [];
+  const seen = new Set();
+  function add(url, path) {
+    if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) return;
+    // Trim common rich-text punctuation/closing delimiters.
+    url = url.replace(/[),.;]+$/g, "");
+    if (seen.has(url)) return;
+    seen.add(url);
+    out.push({ url, path: path || "" });
+  }
+  function walk(v, path, depth) {
+    if (v == null || depth > 10) return;
+    if (typeof v === "string") {
+      const matches = v.match(/https?:\/\/[^\s"'<>]+/g) || [];
+      matches.forEach((u) => add(u, path));
+      return;
+    }
+    if (Array.isArray(v)) {
+      v.forEach((x, i) => walk(x, path + "[" + i + "]", depth + 1));
+      return;
+    }
+    if (typeof v === "object") {
+      for (const [k, x] of Object.entries(v)) {
+        const next = path ? path + "." + k : k;
+        if (typeof x === "string" && /^(url|href|src|download_url|downloadUrl|file_url|fileUrl)$/i.test(k)) {
+          add(x, next);
+        }
+        walk(x, next, depth + 1);
+      }
+    }
+  }
+  walk(payload, "", 0);
+  return out;
+}
+
+function providerForUrl(url) {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (h.includes("docs.google.com")) return "Google Docs/Slides/Sheets";
+    if (h.includes("drive.google.com")) return "Google Drive";
+    if (h.includes("youtube.com") || h.includes("youtu.be")) return "YouTube";
+    if (h.includes("echo360")) return "Echo360";
+    if (h.includes("panopto")) return "Panopto";
+    if (h.includes("zoom.us")) return "Zoom";
+    if (h.includes("edstem") || h.includes("edusercontent") || h.includes("edcdn")) return "Ed";
+    return h;
+  } catch { return "External"; }
+}
+
+function extractExternalResources(payload) {
+  return collectUrls(payload)
+    .filter((x) => !isAttachableUrl(x.url))
+    .map((x) => ({ url: x.url, provider: providerForUrl(x.url), path: x.path }));
+}
+
+const SECRET_KEY_RX = /(^|_)(token|auth|authorization|password|passwd|cookie|secret)(_|$)/i;
+function safeJson(value) {
+  return JSON.stringify(value, (key, val) => {
+    if (SECRET_KEY_RX.test(key)) return "[redacted]";
+    return val;
+  }, 2);
+}
+
+function renderSlideMarkdown(s, rawRelativePath) {
+  const lines = [
+    "# " + (s.title || "Untitled slide"), "",
+    "- Slide ID: " + String(s.id ?? "unknown"),
+    "- Type: " + String(s.type || "unknown"),
+  ];
+
+  let hasReadable = false;
+  const body = htmlToMarkdown(s.content || "").trim();
+  if (body) {
+    lines.push("", "---", "", body);
+    hasReadable = true;
+  }
+
+  const q = s.question;
+  if (q) {
+    const prompt = (q.prompt || "").trim();
+    // Avoid duplicating the same prompt when pickPrimaryContent already caught it.
+    if (prompt && !body.includes(prompt)) {
+      lines.push("", "## Question", "", prompt);
+      hasReadable = true;
+    } else if (!prompt && /question|quiz|poll|choice|response|exercise|activity/i.test(String(s.type || ""))) {
+      lines.push("", "## Activity / question", "", "_(No plain-text prompt field was exposed; raw API JSON is preserved.)_");
+    }
+    if (q.responseType && q.responseType.toLowerCase() !== String(s.type || "").toLowerCase()) {
+      lines.push("", "**Response type:** " + q.responseType);
+    }
+    if (q.options && q.options.length) {
+      lines.push("", "## Options / responses", "");
+      q.options.forEach((o, i) => lines.push("- " + String.fromCharCode(65 + (i % 26)) + ". " + o));
+      hasReadable = true;
+    }
+  }
+
+  const resources = (s.resources || []).filter((r, i, arr) =>
+    r.url && arr.findIndex((x) => x.url === r.url) === i
+  );
+  if (resources.length) {
+    lines.push("", "## External resources", "");
+    for (const r of resources) lines.push("- [" + r.provider + "](" + r.url + ")");
+    hasReadable = true;
+  }
+
+  if (!hasReadable) {
+    lines.push("", "---", "",
+      "_(This Ed slide has no plain-text body in the fields currently understood by the exporter. It was still preserved instead of being skipped.)_");
+  }
+
+  if (rawRelativePath) {
+    lines.push("", "---", "", "Raw API payload: `" + rawRelativePath + "`");
+  }
+  return lines.join("\n").trim() + "\n";
 }
 
 // ---------- Attachments ----------
@@ -302,8 +522,9 @@ function extractAttachments(payload) {
     if (!o) return;
     if (Array.isArray(o)) { o.forEach(walk); return; }
     if (typeof o === "object") {
-      const url = o.url || o.download_url || (o.file && o.file.url);
-      const name = o.name || o.filename || o.title;
+      const url = o.url || o.download_url || o.downloadUrl || o.file_url || o.fileUrl ||
+        o.href || (o.file && (o.file.url || o.file.download_url || o.file.downloadUrl));
+      const name = o.name || o.filename || o.file_name || o.title;
       if (url) add(name, url);
       Object.values(o).forEach(walk);
     } else if (typeof o === "string") {
@@ -315,20 +536,36 @@ function extractAttachments(payload) {
   return found;
 }
 
-function extractInlineImages(content) {
-  if (!content) return [];
+function extractInlineImages(payload) {
   const urls = new Set();
-  // From rich-text XML format: <image src="..."/>
-  const xmlRx = /<(?:image|img)[^>]*src\s*=\s*["']([^"']+)["']/gi;
-  let m;
-  while ((m = xmlRx.exec(content)) !== null) {
-    if (m[1].startsWith("http")) urls.add(m[1]);
+  function add(url) {
+    if (typeof url === "string" && /^https?:\/\//i.test(url)) urls.add(url);
   }
-  // Also from already-converted markdown ![alt](url)
-  const mdRx = /!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/g;
-  while ((m = mdRx.exec(content)) !== null) {
-    urls.add(m[1]);
+  function scanString(text) {
+    if (!text) return;
+    const xmlRx = /<(?:image|img)[^>]*src\s*=\s*["']([^"']+)["']/gi;
+    let m;
+    while ((m = xmlRx.exec(text)) !== null) add(m[1]);
+    const mdRx = /!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/g;
+    while ((m = mdRx.exec(text)) !== null) add(m[1]);
   }
+  function walk(v, parentKey, depth) {
+    if (v == null || depth > 10) return;
+    if (typeof v === "string") { scanString(v); return; }
+    if (Array.isArray(v)) { v.forEach((x) => walk(x, parentKey, depth + 1)); return; }
+    if (typeof v === "object") {
+      const type = String(v.type || v.kind || "").toLowerCase();
+      for (const [k, x] of Object.entries(v)) {
+        if (typeof x === "string" && /^https?:\/\//i.test(x)) {
+          const imageishKey = /image|thumbnail|poster|avatar|picture|src/i.test(k) ||
+            /image/.test(type) || /\.(png|jpe?g|gif|svg|webp)(?:[?#]|$)/i.test(x);
+          if (imageishKey) add(x);
+        }
+        walk(x, k, depth + 1);
+      }
+    }
+  }
+  walk(payload, "", 0);
   return [...urls];
 }
 
@@ -349,125 +586,189 @@ function safe(name) {
 
 // ---------- Download dispatch ----------
 
+async function queueTextDownload(text, mime, filename) {
+  const dataUrl = await blobToDataUrl(new Blob([text], { type: mime }));
+  return chrome.downloads.download({
+    url: dataUrl,
+    filename,
+    conflictAction: "uniquify",
+    saveAs: false,
+  });
+}
+
 async function dispatchDownloads(scan, opts, token) {
   const courseFolder = "Ed/" +
     safe(scan.course.code || scan.course.name || ("course_" + scan.course.id));
   let queued = 0;
+  const report = {
+    exporter_version: "1.3.0",
+    generated_at: new Date().toISOString(),
+    course: {
+      id: scan.course.id,
+      code: scan.course.code || null,
+      name: scan.course.name || null,
+    },
+    lessons: 0,
+    slides_seen: 0,
+    slides_markdown: 0,
+    slide_raw_json: 0,
+    slides_without_plain_text: 0,
+    inline_images_found: 0,
+    inline_images_queued: 0,
+    lesson_attachments_found: 0,
+    lesson_attachments_queued: 0,
+    announcements: 0,
+    selection: {
+      lesson_ids: Array.isArray(opts.selectedLessonIds) ? opts.selectedLessonIds.map(String) : null,
+      announcement_ids: Array.isArray(opts.selectedAnnouncementIds) ? opts.selectedAnnouncementIds.map(String) : null,
+    },
+    failures: [],
+  };
+
+  // A null selection means an older popup requested "all". An empty array means "none".
+  const selectedLessonIds = Array.isArray(opts.selectedLessonIds)
+    ? new Set(opts.selectedLessonIds.map(String))
+    : null;
+  const selectedAnnouncementIds = Array.isArray(opts.selectedAnnouncementIds)
+    ? new Set(opts.selectedAnnouncementIds.map(String))
+    : null;
 
   if (opts.lessons) {
     for (let i = 0; i < scan.lessons.length; i++) {
       const l = scan.lessons[i];
+      if (selectedLessonIds && !selectedLessonIds.has(String(l.id))) continue;
+      report.lessons++;
       const folder = courseFolder + "/lessons/" +
         String(i + 1).padStart(2, "0") + "_" + safe(l.title);
 
-      // Save each slide's text as Markdown, with inline images downloaded locally.
       for (let j = 0; j < (l.slides || []).length; j++) {
         const s = l.slides[j];
+        report.slides_seen++;
         const slideBase = String(j + 1).padStart(2, "0") + "_" + safe(s.title);
         const slidePath = folder + "/slides/" + slideBase;
+        const rawRel = "./_raw/" + slideBase + ".json";
         const imgRel = "./" + slideBase + "_images";
-        let bodyMd = htmlToMarkdown(s.content);
 
-        if (s.content) {
-          const imgUrls = extractInlineImages(s.content);
-          let idx = 1;
-          for (const url of imgUrls) {
+        // Always produce Markdown, including questions/activities/unknown types.
+        let bodyMd = renderSlideMarkdown(s, rawRel);
+        const beforeReadable = htmlToMarkdown(s.content || "").trim();
+        if (!beforeReadable && !(s.question && ((s.question.prompt || "").trim() || (s.question.options || []).length)) &&
+            !(s.resources || []).length) {
+          report.slides_without_plain_text++;
+        }
+
+        // Discover images from the entire raw slide object, not just s.content.
+        const imgUrls = extractInlineImages(s.raw || s.content || "");
+        report.inline_images_found += imgUrls.length;
+        let idx = 1;
+        for (const url of imgUrls) {
+          try {
             const probe = await probeUrl(url, token);
-            const ext = probe.ext || ".bin";
+            const ext = probe.ext || (/\.(png|jpe?g|gif|svg|webp)(?:[?#]|$)/i.exec(url)?.[1] ?
+              "." + /\.(png|jpe?g|gif|svg|webp)(?:[?#]|$)/i.exec(url)[1].replace("jpeg", "jpg") : ".bin");
             const localName = "img_" + String(idx).padStart(3, "0") + ext;
             idx++;
-            // Rewrite both the original URL and any post-md form
             bodyMd = bodyMd.split(url).join(imgRel + "/" + localName);
-            try {
-              await chrome.downloads.download({
-                url: url,
-                filename: folder + "/slides/" + slideBase + "_images/" + localName,
-                conflictAction: "uniquify",
-                saveAs: false,
-              });
-              queued++;
-            } catch (e) { console.warn("img dl failed", url, e); }
+            await chrome.downloads.download({
+              url,
+              filename: folder + "/slides/" + slideBase + "_images/" + localName,
+              conflictAction: "uniquify",
+              saveAs: false,
+            });
+            queued++;
+            report.inline_images_queued++;
+          } catch (e) {
+            report.failures.push({ kind: "inline_image", lesson_id: l.id, slide_id: s.id, url, error: String(e.message || e) });
           }
         }
 
-        if (bodyMd && bodyMd.trim()) {
-          const md = "# " + s.title + "\n\n" + bodyMd;
-          const dataUrl = await blobToDataUrl(new Blob([md], { type: "text/markdown" }));
-          await chrome.downloads.download({
-            url: dataUrl,
-            filename: slidePath + ".md",
-            conflictAction: "uniquify",
-            saveAs: false,
-          });
+        try {
+          await queueTextDownload(bodyMd, "text/markdown", slidePath + ".md");
           queued++;
+          report.slides_markdown++;
+        } catch (e) {
+          report.failures.push({ kind: "slide_markdown", lesson_id: l.id, slide_id: s.id, error: String(e.message || e) });
+        }
+
+        // Raw payload means a future parser can recover new/unsupported Ed block types.
+        try {
+          await queueTextDownload(
+            safeJson(s.raw || s),
+            "application/json",
+            folder + "/slides/_raw/" + slideBase + ".json"
+          );
+          queued++;
+          report.slide_raw_json++;
+        } catch (e) {
+          report.failures.push({ kind: "slide_raw_json", lesson_id: l.id, slide_id: s.id, error: String(e.message || e) });
         }
       }
 
-      // Lesson-level files (PDFs, recordings, etc.) — probe for real ext
+      // Lesson-level files (PDFs, recordings, spreadsheets, documents, etc.).
+      report.lesson_attachments_found += (l.files || []).length;
       for (const f of (l.files || [])) {
         try {
           const probe = await probeUrl(f.url, token);
           const baseName = probe.filename || f.name || nameFromUrl(f.url);
           let finalName = safe(baseName);
-          // Append extension if filename doesn't have one and we got one from CT
-          if (probe.ext && !/\.[a-z0-9]{1,8}$/i.test(finalName)) {
-            finalName += probe.ext;
-          }
+          if (probe.ext && !/\.[a-z0-9]{1,8}$/i.test(finalName)) finalName += probe.ext;
           await chrome.downloads.download({
             url: f.url,
-            filename: folder + "/" + finalName,
+            filename: folder + "/_attachments/" + finalName,
             conflictAction: "uniquify",
             saveAs: false,
           });
           queued++;
-        } catch (e) { console.warn("file dl failed", f.url, e); }
+          report.lesson_attachments_queued++;
+        } catch (e) {
+          report.failures.push({ kind: "lesson_attachment", lesson_id: l.id, url: f.url, error: String(e.message || e) });
+        }
       }
     }
   }
 
   if (opts.announcements) {
     for (const a of (scan.announcements || [])) {
-      // Process announcement images same way
+      if (selectedAnnouncementIds && !selectedAnnouncementIds.has(String(a.id))) continue;
+      report.announcements++;
       const imgUrls = extractInlineImages(a.content);
       const slideBase = (a.created_at || "").slice(0, 10) + "_" + safe(a.title);
       let bodyMd = htmlToMarkdown(a.content);
       let idx = 1;
       const imgRel = "./" + slideBase + "_images";
       for (const url of imgUrls) {
-        const probe = await probeUrl(url, token);
-        const ext = probe.ext || ".bin";
-        const localName = "img_" + String(idx).padStart(3, "0") + ext;
-        idx++;
-        bodyMd = bodyMd.split(url).join(imgRel + "/" + localName);
         try {
+          const probe = await probeUrl(url, token);
+          const ext = probe.ext || ".bin";
+          const localName = "img_" + String(idx).padStart(3, "0") + ext;
+          idx++;
+          bodyMd = bodyMd.split(url).join(imgRel + "/" + localName);
           await chrome.downloads.download({
-            url: url,
+            url,
             filename: courseFolder + "/announcements/" + slideBase + "_images/" + localName,
             conflictAction: "uniquify",
             saveAs: false,
           });
           queued++;
-        } catch (e) { console.warn("ann img failed", url, e); }
+        } catch (e) {
+          report.failures.push({ kind: "announcement_image", announcement_id: a.id, url, error: String(e.message || e) });
+        }
       }
 
-      const md = announcementToMd(a, scan.course, bodyMd);
-      const dataUrl = await blobToDataUrl(new Blob([md], { type: "text/markdown" }));
-      await chrome.downloads.download({
-        url: dataUrl,
-        filename: courseFolder + "/announcements/" + safe(slideBase) + ".md",
-        conflictAction: "uniquify",
-        saveAs: false,
-      });
-      queued++;
+      try {
+        const md = announcementToMd(a, scan.course, bodyMd);
+        await queueTextDownload(md, "text/markdown", courseFolder + "/announcements/" + safe(slideBase) + ".md");
+        queued++;
+      } catch (e) {
+        report.failures.push({ kind: "announcement_markdown", announcement_id: a.id, error: String(e.message || e) });
+      }
 
       for (const f of (a.files || [])) {
         try {
           const probe = await probeUrl(f.url, token);
           const baseName = probe.filename || f.name || nameFromUrl(f.url);
           let finalName = safe(baseName);
-          if (probe.ext && !/\.[a-z0-9]{1,8}$/i.test(finalName)) {
-            finalName += probe.ext;
-          }
+          if (probe.ext && !/\.[a-z0-9]{1,8}$/i.test(finalName)) finalName += probe.ext;
           await chrome.downloads.download({
             url: f.url,
             filename: courseFolder + "/announcements/_attachments/" + finalName,
@@ -475,11 +776,22 @@ async function dispatchDownloads(scan, opts, token) {
             saveAs: false,
           });
           queued++;
-        } catch (e) { console.warn("ann file failed", f.url, e); }
+        } catch (e) {
+          report.failures.push({ kind: "announcement_attachment", announcement_id: a.id, url: f.url, error: String(e.message || e) });
+        }
       }
     }
   }
-  return queued;
+
+  report.complete_slide_coverage = report.slides_seen === report.slides_markdown;
+  try {
+    await queueTextDownload(safeJson(report), "application/json", courseFolder + "/export-report.json");
+    queued++;
+  } catch (e) {
+    console.warn("report download failed", e);
+  }
+
+  return { queued, report };
 }
 
 function blobToDataUrl(blob) {
@@ -564,8 +876,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const data = await scanCourse(msg.base, msg.courseId, msg.regionPath || "", msg.token);
         sendResponse({ ok: true, data });
       } else if (msg.type === "download") {
-        const queued = await dispatchDownloads(msg.scan, msg.opts || {}, msg.token);
-        sendResponse({ ok: true, queued });
+        const result = await dispatchDownloads(msg.scan, msg.opts || {}, msg.token);
+        sendResponse({ ok: true, queued: result.queued, report: result.report });
       } else {
         sendResponse({ ok: false, error: "unknown message type" });
       }

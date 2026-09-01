@@ -91,42 +91,122 @@ function send(msg) {
   });
 }
 
+function selectionItems(kind) {
+  return Array.from(document.querySelectorAll('.select-item[data-kind="' + kind + '"]'));
+}
+
+function updateSelectionState() {
+  const lessonsEnabled = $("opt-lessons").checked;
+  const announcementsEnabled = $("opt-announce").checked;
+
+  const lessonBoxes = selectionItems("lesson");
+  const announcementBoxes = selectionItems("announcement");
+
+  lessonBoxes.forEach((box) => {
+    box.disabled = !lessonsEnabled;
+    const row = box.closest(".select-row");
+    if (row) row.classList.toggle("disabled", !lessonsEnabled);
+  });
+  announcementBoxes.forEach((box) => {
+    box.disabled = !announcementsEnabled;
+    const row = box.closest(".select-row");
+    if (row) row.classList.toggle("disabled", !announcementsEnabled);
+  });
+
+  const selectedLessons = lessonsEnabled ? lessonBoxes.filter((x) => x.checked).length : 0;
+  const selectedAnnouncements = announcementsEnabled ? announcementBoxes.filter((x) => x.checked).length : 0;
+  const total = selectedLessons + selectedAnnouncements;
+
+  $("selected-summary").textContent =
+    "已选 " + selectedLessons + " Lessons / " + selectedAnnouncements + " 公告";
+  $("download").textContent = total ? ("下载已选 (" + total + ")") : "下载已选";
+  $("download").disabled = !lastScan || total === 0;
+}
+
+function addSelectRow(ul, kind, id, title, meta) {
+  const li = document.createElement("li");
+  li.className = "select-row";
+
+  const label = document.createElement("label");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = true;
+  input.className = "select-item";
+  input.dataset.kind = kind;
+  input.dataset.id = String(id);
+
+  const main = document.createElement("span");
+  main.className = "select-main";
+  const name = document.createElement("span");
+  name.className = "select-title";
+  name.textContent = title;
+  const detail = document.createElement("span");
+  detail.className = "select-meta";
+  detail.textContent = meta || "";
+
+  main.appendChild(name);
+  main.appendChild(detail);
+  label.appendChild(input);
+  label.appendChild(main);
+  li.appendChild(label);
+  ul.appendChild(li);
+}
+
 function renderPreview(scan) {
   $("preview").hidden = false;
   $("course-name").textContent = scan.course.name || scan.course.code || "(unknown)";
   $("course-id").textContent = "#" + scan.course.id;
   $("cnt-lessons").textContent = scan.lessons.length;
   let fileCount = 0;
-  scan.lessons.forEach((l) => { fileCount += (l.files || []).length; });
+  let slideCount = 0;
+  scan.lessons.forEach((l) => {
+    fileCount += (l.files || []).length;
+    slideCount += (l.slides || []).length;
+  });
+  $("cnt-slides").textContent = slideCount;
   (scan.announcements || []).forEach((a) => { fileCount += (a.files || []).length; });
   $("cnt-files").textContent = fileCount;
   $("cnt-announce").textContent = (scan.announcements || []).length;
 
   const ul = $("item-list");
   ul.innerHTML = "";
-  scan.lessons.forEach((l) => {
+
+  if (scan.lessons.length) {
     const head = document.createElement("li");
     head.className = "group";
-    head.textContent = "Lesson: " + l.title;
+    head.textContent = "Lessons";
     ul.appendChild(head);
-    (l.files || []).forEach((f) => {
-      const li = document.createElement("li");
-      li.textContent = f.name;
-      ul.appendChild(li);
+    scan.lessons.forEach((l) => {
+      addSelectRow(
+        ul,
+        "lesson",
+        l.id,
+        l.title,
+        (l.slides || []).length + " slides · " + (l.files || []).length + " attachments"
+      );
     });
-  });
+  }
+
   if ((scan.announcements || []).length) {
     const head = document.createElement("li");
     head.className = "group";
     head.textContent = "Announcements / Pinned";
     ul.appendChild(head);
     scan.announcements.forEach((a) => {
-      const li = document.createElement("li");
-      li.textContent = a.title;
-      ul.appendChild(li);
+      addSelectRow(
+        ul,
+        "announcement",
+        a.id,
+        a.title || "Announcement",
+        (a.files || []).length + " attachments"
+      );
     });
   }
-  $("download").disabled = fileCount === 0 && (scan.announcements || []).length === 0;
+
+  ul.querySelectorAll(".select-item").forEach((box) => {
+    box.addEventListener("change", updateSelectionState);
+  });
+  updateSelectionState();
 }
 
 $("scan").addEventListener("click", async () => {
@@ -175,7 +255,9 @@ $("scan").addEventListener("click", async () => {
     lastScan = resp.data;
     lastScan._token = tokenInfo.token; // pass to download step
     renderPreview(lastScan);
+    const slideCount = lastScan.lessons.reduce((n, l) => n + (l.slides || []).length, 0);
     setStatus("Scan complete - " + lastScan.lessons.length + " lessons, " +
+              slideCount + " slides, " +
               (lastScan.announcements || []).length + " announcements", "ok");
   } catch (e) {
     setStatus("Scan failed: " + e.message, "err");
@@ -189,6 +271,8 @@ $("download").addEventListener("click", async () => {
   const opts = {
     lessons: $("opt-lessons").checked,
     announcements: $("opt-announce").checked,
+    selectedLessonIds: selectionItems("lesson").filter((x) => x.checked).map((x) => x.dataset.id),
+    selectedAnnouncementIds: selectionItems("announcement").filter((x) => x.checked).map((x) => x.dataset.id),
   };
   setStatus("Dispatching downloads (see chrome://downloads)", "busy");
   $("download").disabled = true;
@@ -200,13 +284,29 @@ $("download").addEventListener("click", async () => {
       token: lastScan._token,
     });
     if (!resp.ok) throw new Error(resp.error || "download failed");
-    setStatus("Queued " + resp.queued + " downloads. See browser download list.", "ok");
+    const r = resp.report || {};
+    const coverage = r.slides_seen != null ? (" Slides: " + r.slides_markdown + "/" + r.slides_seen + ".") : "";
+    const failures = (r.failures || []).length ? (" Failures logged: " + r.failures.length + ".") : "";
+    setStatus("Queued " + resp.queued + " downloads." + coverage + failures + " See export-report.json.", "ok");
   } catch (e) {
     setStatus("Download failed: " + e.message, "err");
   } finally {
     $("download").disabled = false;
   }
 });
+
+$("select-all").addEventListener("click", () => {
+  document.querySelectorAll(".select-item:not(:disabled)").forEach((box) => { box.checked = true; });
+  updateSelectionState();
+});
+
+$("select-none").addEventListener("click", () => {
+  document.querySelectorAll(".select-item:not(:disabled)").forEach((box) => { box.checked = false; });
+  updateSelectionState();
+});
+
+$("opt-lessons").addEventListener("change", updateSelectionState);
+$("opt-announce").addEventListener("change", updateSelectionState);
 
 (async () => {
   const tab = await getActiveTab();

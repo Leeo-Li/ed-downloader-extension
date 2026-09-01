@@ -8,7 +8,7 @@
 <body>
   <header>
     <div class="title">📚 Ed Downloader</div>
-    <div class="subtitle">备份当前课的 lessons + 公告</div>
+    <div class="subtitle">扫描后选择要备份的 Lessons / 公告</div>
   </header>
 
   <main>
@@ -16,7 +16,7 @@
 
     <div class="actions">
       <button id="scan" class="btn primary">扫描当前课程</button>
-      <button id="download" class="btn" disabled>下载全部</button>
+      <button id="download" class="btn" disabled>下载已选</button>
     </div>
 
     <section id="preview" class="preview" hidden>
@@ -26,12 +26,18 @@
       </div>
       <div class="counts">
         <span class="chip">📁 Lessons: <b id="cnt-lessons">0</b></span>
+        <span class="chip">🧩 Slides: <b id="cnt-slides">0</b></span>
         <span class="chip">📄 文件: <b id="cnt-files">0</b></span>
         <span class="chip">📢 公告: <b id="cnt-announce">0</b></span>
       </div>
-      <details>
-        <summary>查看清单</summary>
-        <ul id="item-list"></ul>
+      <div class="selection-toolbar">
+        <button id="select-all" class="mini-btn" type="button">全选</button>
+        <button id="select-none" class="mini-btn" type="button">清空</button>
+        <span id="selected-summary" class="selected-summary">未选择</span>
+      </div>
+      <details open>
+        <summary>选择下载内容</summary>
+        <ul id="item-list" class="select-list"></ul>
       </details>
     </section>
 
@@ -47,7 +53,7 @@
 
   <footer>
     <a href="https://github.com" target="_blank" id="help">使用说明</a>
-    <span class="muted">v1.0 · 仅限个人学习用途</span>
+    <span class="muted">v1.3.0 · 仅限个人学习用途</span>
   </footer>
 
   <script src="popup.js"></script>
